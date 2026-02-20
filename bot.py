@@ -1,20 +1,22 @@
 # bot.py
 import os
-import asyncio
 import sqlite3
-from flask import Flask
-from telegram import Update
+import asyncio
+from flask import Flask, request
+from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from hypercorn.asyncio import serve
-from hypercorn.config import Config
 
 # --- Token Telegram ---
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("Le TOKEN n'est pas défini dans les Environment Variables")
 
+# --- Initialisation Bot ---
+bot = Bot(TOKEN)
+app_telegram = ApplicationBuilder().token(TOKEN).build()
+
 # --- Données du bot ---
-user_stats = {}  # {user_id: {"777":0, "other":0, "total":0, "name":username}}
+user_stats = {}  # pas utilisé ici, on utilise la DB
 global_stats = {"777": 0, "other": 0, "total": 0}
 
 # --- Base de données ---
@@ -35,11 +37,10 @@ CREATE TABLE IF NOT EXISTS scores (
 """)
 conn.commit()
 
-# --- Décodage des rouleaux (valeur 1-64) ---
+# --- Décodage des rouleaux ---
 SYMBOLS = ["bar", "grape", "lemon", "seven"]
 
 def decode_slots(value: int):
-    """Retourne (reel1, reel2, reel3) sous forme de strings."""
     v = value - 1
     r1 = SYMBOLS[v % 4]
     r2 = SYMBOLS[(v // 4) % 4]
@@ -60,40 +61,40 @@ WIN_COLUMN = {
     "seven": "wins_seven",
 }
 
-# --- Gestion des 🎰 ---
+# --- Gestion du dice ---
 async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not (update.message.dice and update.message.dice.emoji == "🎰"):
-        return
+    if update.message and update.message.dice and update.message.dice.emoji == "🎰":
+        user = update.message.from_user
+        value = update.message.dice.value
+        r1, r2, r3 = decode_slots(value)
 
-    user = update.message.from_user
-    value = update.message.dice.value
-    r1, r2, r3 = decode_slots(value)
+        # Créer le joueur s'il n'existe pas
+        cursor.execute("SELECT user_id FROM scores WHERE user_id=?", (user.id,))
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO scores (user_id, username) VALUES (?, ?)",
+                (user.id, user.first_name)
+            )
+            conn.commit()
 
-    # Créer le joueur s'il n'existe pas
-    cursor.execute("SELECT user_id FROM scores WHERE user_id=?", (user.id,))
-    if not cursor.fetchone():
-        cursor.execute("INSERT INTO scores (user_id, username) VALUES (?, ?)", (user.id, user.first_name))
-        conn.commit()
+        cursor.execute("UPDATE scores SET spins = spins + 1 WHERE user_id=?", (user.id,))
 
-    cursor.execute("UPDATE scores SET spins = spins + 1 WHERE user_id=?", (user.id,))
+        # Victoire = 3 rouleaux identiques
+        if r1 == r2 == r3:
+            col = WIN_COLUMN[r1]
+            cursor.execute(f"""
+                UPDATE scores SET {col} = {col} + 1, total_wins = total_wins + 1
+                WHERE user_id=?
+            """, (user.id,))
+            conn.commit()
 
-    # Victoire = 3 rouleaux identiques
-    if r1 == r2 == r3:
-        col = WIN_COLUMN[r1]
-        cursor.execute(f"""
-            UPDATE scores SET {col} = {col} + 1, total_wins = total_wins + 1
-            WHERE user_id=?
-        """, (user.id,))
+            if r1 == "seven":
+                await update.message.reply_text(f"🎉 JACKPOT 7️⃣7️⃣7️⃣ pour {user.first_name} !!!")
+            else:
+                emoji_name = SYMBOL_EMOJI[r1]
+                await update.message.reply_text(f"✨ Victoire {emoji_name}{emoji_name}{emoji_name} pour {user.first_name} !")
 
-        if r1 == "seven":
-            await update.message.reply_text(f"🎉 JACKPOT 7️⃣7️⃣7️⃣ pour {user.first_name} !!!")
-        else:
-            emoji_name = SYMBOL_EMOJI[r1]
-            await update.message.reply_text(f"✨ Victoire {emoji_name}{emoji_name}{emoji_name} pour {user.first_name} !")
-
-    conn.commit()
-
-# --- /stats : stats individuelles ---
+# --- Commandes ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     cursor.execute("""
@@ -115,7 +116,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 Total victoires : {total}"
     )
 
-# --- /top777 : classement jackpots ---
 async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT username, wins_seven FROM scores ORDER BY wins_seven DESC LIMIT 10")
     results = cursor.fetchall()
@@ -127,7 +127,6 @@ async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {name} — {score} 🎰\n"
     await update.message.reply_text(text)
 
-# --- /topsecondaire : classement victoires secondaires ---
 async def topsecondaire(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("""
         SELECT username, (wins_bar + wins_grape + wins_lemon) as sec
@@ -142,7 +141,6 @@ async def topsecondaire(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {name} — {score}\n"
     await update.message.reply_text(text)
 
-# --- /top : classement total ---
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT username, total_wins FROM scores ORDER BY total_wins DESC LIMIT 10")
     results = cursor.fetchall()
@@ -154,7 +152,6 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {name} — {score} victoires\n"
     await update.message.reply_text(text)
 
-# --- /groupe : stats globales du groupe ---
 async def groupe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("""
         SELECT SUM(spins), SUM(wins_seven), SUM(wins_bar), SUM(wins_grape), SUM(wins_lemon), SUM(total_wins)
@@ -175,38 +172,36 @@ async def groupe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 Total victoires : {total}"
     )
 
-# --- Configuration Telegram ---
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_dice))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("top777", top777))
-app.add_handler(CommandHandler("topsecondaire", topsecondaire))
-app.add_handler(CommandHandler("top", top))
-app.add_handler(CommandHandler("groupe", groupe))
-
-# --- Flask Web Service pour Render ---
+# --- Flask Web Service ---
 flask_app = Flask("")
+
+# Webhook endpoint
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    asyncio.run(app_telegram.update_queue.put(update))
+    return "OK"
 
 @flask_app.route("/")
 def home():
     return "Bot Telegram actif! 🎰"
 
-# --- Main async pour Render Free ---
-app_telegram = app  # juste pour clarifier le nom
+# --- Ajout handlers ---
+app_telegram.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_dice))
+app_telegram.add_handler(CommandHandler("stats", stats))
+app_telegram.add_handler(CommandHandler("top777", top777))
+app_telegram.add_handler(CommandHandler("topsecondaire", topsecondaire))
+app_telegram.add_handler(CommandHandler("top", top))
+app_telegram.add_handler(CommandHandler("groupe", groupe))
 
-async def main():
-    await app_telegram.initialize()
-    await app_telegram.start()
+# --- Lancement Hypercorn + Flask ---
+if __name__ == "__main__":
+    import hypercorn.asyncio
+    from hypercorn.config import Config
 
     port = int(os.environ.get("PORT", 10000))
     config = Config()
     config.bind = [f"0.0.0.0:{port}"]
 
-    # Lance Flask (Hypercorn) et Telegram simultanément
-    flask_task = asyncio.create_task(serve(flask_app, config))
-    telegram_task = asyncio.create_task(app_telegram.updater.start_polling())
-
-    await asyncio.gather(flask_task, telegram_task)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # --- Important: pas de run_polling(), tout via webhook ---
+    asyncio.run(hypercorn.asyncio.serve(flask_app, config))
