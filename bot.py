@@ -113,7 +113,7 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Lancement bot ---
 app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(MessageHandler(filters.ALL, handle_dice))
+app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_dice))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("top777", top777))
 app.add_handler(CommandHandler("top", top))
