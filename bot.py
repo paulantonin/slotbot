@@ -1,120 +1,98 @@
+# bot.py
 import os
-import random
-import sqlite3
+import threading
+from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Récupère le token depuis Environment Variables
-TOKEN = os.getenv("TOKEN")
+# --- Token Telegram ---
+TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
-    raise ValueError("Le TOKEN n'est pas défini dans les variables d'environnement")
+    raise ValueError("Le TOKEN n'est pas défini dans les Environment Variables")
 
-# --- Base de données ---
-conn = sqlite3.connect("scores.db", check_same_thread=False)
-cursor = conn.cursor()
+# --- Données du bot ---
+# Structure pour compter les victoires
+# Victoires par utilisateur : {user_id: {"777": 0, "other": 0, "total": 0}}
+user_stats = {}
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS scores (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    spins INTEGER DEFAULT 0,
-    wins_777 INTEGER DEFAULT 0,
-    secondary_wins INTEGER DEFAULT 0,
-    total_wins INTEGER DEFAULT 0
-)
-""")
-conn.commit()
+# Compteurs globaux
+global_stats = {"777": 0, "other": 0, "total": 0}
 
-# --- Combinaisons secondaires ---
-# Tu peux ajouter toutes les autres combinaisons que tu veux
-SECONDARY_VALUES = [111, 222, 333, 444, 555, 666]  # Exemple
-
-# --- Gestion machine à sous ---
+# --- Fonctions du bot ---
 async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.dice and update.message.dice.emoji == "🎰":
-        user = update.message.from_user
-        value = update.message.dice.value
+    """Traite les messages contenant les émojis de machine à sous"""
+    text = update.message.text
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or update.message.from_user.first_name
 
-        cursor.execute("SELECT * FROM scores WHERE user_id=?", (user.id,))
-        data = cursor.fetchone()
+    # Initialisation stats utilisateur si besoin
+    if user_id not in user_stats:
+        user_stats[user_id] = {"777": 0, "other": 0, "total": 0, "name": username}
 
-        if not data:
-            cursor.execute(
-                "INSERT INTO scores (user_id, username) VALUES (?, ?)",
-                (user.id, user.first_name)
-            )
-            conn.commit()
+    # Détection victoire
+    if "777" in text:
+        win_type = "777"
+        user_stats[user_id]["777"] += 1
+        global_stats["777"] += 1
+    elif "🍋🍋🍋" in text:  # exemple victoire secondaire
+        win_type = "other"
+        user_stats[user_id]["other"] += 1
+        global_stats["other"] += 1
+    else:
+        # Vérifier si message contient d'autres motifs "victoire"
+        # Pour l'exemple, tout autre combinaison de trois émojis différents
+        win_type = "other"
+        user_stats[user_id]["other"] += 1
+        global_stats["other"] += 1
 
-        cursor.execute("UPDATE scores SET spins = spins + 1 WHERE user_id=?", (user.id,))
+    user_stats[user_id]["total"] += 1
+    global_stats["total"] += 1
 
-        # Jackpot 777
-        if value == 777:
-            cursor.execute("""
-                UPDATE scores
-                SET wins_777 = wins_777 + 1,
-                    total_wins = total_wins + 1
-                WHERE user_id=?
-            """, (user.id,))
-            await update.message.reply_text(f"🎉 JACKPOT 777 pour {user.first_name} !!!")
+    await update.message.reply_text(f"Spin reçu! Type de victoire: {win_type}")
 
-        # Victoires secondaires
-        elif value in SECONDARY_VALUES:
-            cursor.execute("""
-                UPDATE scores
-                SET secondary_wins = secondary_wins + 1,
-                    total_wins = total_wins + 1
-                WHERE user_id=?
-            """, (user.id,))
-            await update.message.reply_text(f"✨ Victoire secondaire pour {user.first_name} !")
-
-        conn.commit()
-
-# --- Commandes ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    cursor.execute(
-        "SELECT spins, wins_777, secondary_wins, total_wins FROM scores WHERE user_id=?",
-        (user.id,)
+    """Affiche les stats globales"""
+    msg = (
+        f"📊 Statistiques globales :\n"
+        f"777 : {global_stats['777']}\n"
+        f"Autres victoires : {global_stats['other']}\n"
+        f"Total : {global_stats['total']}"
     )
-    data = cursor.fetchone()
-    if not data:
-        await update.message.reply_text("Aucune statistique trouvée.")
-        return
-    spins, w777, sec, total = data
-    await update.message.reply_text(
-        f"📊 Stats de {user.first_name} :\n"
-        f"🎰 Tentatives : {spins}\n"
-        f"🏆 777 : {w777}\n"
-        f"✨ Victoires secondaires : {sec}\n"
-        f"🥇 Total victoires : {total}"
-    )
+    await update.message.reply_text(msg)
 
 async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute("SELECT username, wins_777 FROM scores ORDER BY wins_777 DESC LIMIT 10")
-    results = cursor.fetchall()
-    if not results:
-        await update.message.reply_text("Pas encore de victoires 777.")
-        return
-    text = "🏆 Classement 777 :\n\n"
-    for i, (name, score) in enumerate(results, start=1):
-        text += f"{i}. {name} - {score} 🎰\n"
-    await update.message.reply_text(text)
+    """Classement par 777"""
+    ranking = sorted(user_stats.values(), key=lambda x: x["777"], reverse=True)
+    msg = "🏆 Classement 777 :\n"
+    for i, u in enumerate(ranking[:10], start=1):
+        msg += f"{i}. {u['name']}: {u['777']}\n"
+    await update.message.reply_text(msg)
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute("SELECT username, total_wins FROM scores ORDER BY total_wins DESC LIMIT 10")
-    results = cursor.fetchall()
-    if not results:
-        await update.message.reply_text("Pas encore de victoires.")
-        return
-    text = "🥇 Classement total des victoires :\n\n"
-    for i, (name, score) in enumerate(results, start=1):
-        text += f"{i}. {name} - {score} victoires\n"
-    await update.message.reply_text(text)
+    """Classement total des victoires"""
+    ranking = sorted(user_stats.values(), key=lambda x: x["total"], reverse=True)
+    msg = "🏅 Classement total :\n"
+    for i, u in enumerate(ranking[:10], start=1):
+        msg += f"{i}. {u['name']}: {u['total']}\n"
+    await update.message.reply_text(msg)
 
-# --- Lancement bot ---
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_dice))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("top777", top777))
-app.add_handler(CommandHandler("top", top))
-app.run_polling()
+# --- Création du bot Telegram ---
+app_telegram = ApplicationBuilder().token(TOKEN).build()
+app_telegram.add_handler(MessageHandler(filters.ALL, handle_dice))
+app_telegram.add_handler(CommandHandler("stats", stats))
+app_telegram.add_handler(CommandHandler("top777", top777))
+app_telegram.add_handler(CommandHandler("top", top))
+
+# Démarrage du bot dans un thread séparé
+threading.Thread(target=app_telegram.run_polling, daemon=True).start()
+
+# --- Flask Web Service pour Render ---
+flask_app = Flask("")
+
+@flask_app.route("/")
+def home():
+    return "Bot Telegram actif! 🎰"
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))  # Render fournit la variable PORT
+    flask_app.run(host="0.0.0.0", port=port)
