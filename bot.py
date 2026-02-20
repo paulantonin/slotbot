@@ -1,10 +1,12 @@
 # bot.py
 import os
+import asyncio
 import sqlite3
-import threading
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
 
 # --- Token Telegram ---
 TOKEN = os.environ.get("TOKEN")
@@ -12,7 +14,7 @@ if not TOKEN:
     raise ValueError("Le TOKEN n'est pas défini dans les Environment Variables")
 
 # --- Données du bot ---
-user_stats = {}
+user_stats = {}  # {user_id: {"777":0, "other":0, "total":0, "name":username}}
 global_stats = {"777": 0, "other": 0, "total": 0}
 
 # --- Base de données ---
@@ -33,24 +35,32 @@ CREATE TABLE IF NOT EXISTS scores (
 """)
 conn.commit()
 
-# --- Décodage rouleaux ---
+# --- Décodage des rouleaux (valeur 1-64) ---
 SYMBOLS = ["bar", "grape", "lemon", "seven"]
-SYMBOL_EMOJI = {
-    "bar":   "🍫 BAR",
-    "grape": "🍇 Raisin",
-    "lemon": "🍋 Citron",
-    "seven": "7️⃣ Seven",
-}
-WIN_COLUMN = {"bar": "wins_bar", "grape": "wins_grape", "lemon": "wins_lemon", "seven": "wins_seven"}
 
 def decode_slots(value: int):
+    """Retourne (reel1, reel2, reel3) sous forme de strings."""
     v = value - 1
     r1 = SYMBOLS[v % 4]
     r2 = SYMBOLS[(v // 4) % 4]
     r3 = SYMBOLS[(v // 16) % 4]
     return r1, r2, r3
 
-# --- Gestion des spins ---
+SYMBOL_EMOJI = {
+    "bar":   "🍫 BAR",
+    "grape": "🍇 Raisin",
+    "lemon": "🍋 Citron",
+    "seven": "7️⃣ Seven",
+}
+
+WIN_COLUMN = {
+    "bar":   "wins_bar",
+    "grape": "wins_grape",
+    "lemon": "wins_lemon",
+    "seven": "wins_seven",
+}
+
+# --- Gestion des 🎰 ---
 async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (update.message.dice and update.message.dice.emoji == "🎰"):
         return
@@ -59,6 +69,7 @@ async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.dice.value
     r1, r2, r3 = decode_slots(value)
 
+    # Créer le joueur s'il n'existe pas
     cursor.execute("SELECT user_id FROM scores WHERE user_id=?", (user.id,))
     if not cursor.fetchone():
         cursor.execute("INSERT INTO scores (user_id, username) VALUES (?, ?)", (user.id, user.first_name))
@@ -66,6 +77,7 @@ async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cursor.execute("UPDATE scores SET spins = spins + 1 WHERE user_id=?", (user.id,))
 
+    # Victoire = 3 rouleaux identiques
     if r1 == r2 == r3:
         col = WIN_COLUMN[r1]
         cursor.execute(f"""
@@ -81,7 +93,7 @@ async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn.commit()
 
-# --- Commandes ---
+# --- /stats : stats individuelles ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     cursor.execute("""
@@ -103,6 +115,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 Total victoires : {total}"
     )
 
+# --- /top777 : classement jackpots ---
 async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT username, wins_seven FROM scores ORDER BY wins_seven DESC LIMIT 10")
     results = cursor.fetchall()
@@ -114,6 +127,7 @@ async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {name} — {score} 🎰\n"
     await update.message.reply_text(text)
 
+# --- /topsecondaire : classement victoires secondaires ---
 async def topsecondaire(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("""
         SELECT username, (wins_bar + wins_grape + wins_lemon) as sec
@@ -128,6 +142,7 @@ async def topsecondaire(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {name} — {score}\n"
     await update.message.reply_text(text)
 
+# --- /top : classement total ---
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT username, total_wins FROM scores ORDER BY total_wins DESC LIMIT 10")
     results = cursor.fetchall()
@@ -139,6 +154,7 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {name} — {score} victoires\n"
     await update.message.reply_text(text)
 
+# --- /groupe : stats globales du groupe ---
 async def groupe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("""
         SELECT SUM(spins), SUM(wins_seven), SUM(wins_bar), SUM(wins_grape), SUM(wins_lemon), SUM(total_wins)
@@ -159,7 +175,7 @@ async def groupe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 Total victoires : {total}"
     )
 
-# --- Application Telegram ---
+# --- Configuration Telegram ---
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_dice))
 app.add_handler(CommandHandler("stats", stats))
@@ -168,20 +184,29 @@ app.add_handler(CommandHandler("topsecondaire", topsecondaire))
 app.add_handler(CommandHandler("top", top))
 app.add_handler(CommandHandler("groupe", groupe))
 
-# --- Flask pour Render ---
+# --- Flask Web Service pour Render ---
 flask_app = Flask("")
 
 @flask_app.route("/")
 def home():
     return "Bot Telegram actif! 🎰"
 
-# --- Lancement bot + Flask ---
-if __name__ == "__main__":
-    import asyncio
+# --- Main async pour Render Free ---
+app_telegram = app  # juste pour clarifier le nom
 
-    # Lancer Telegram bot dans un thread
-    threading.Thread(target=lambda: app.run_polling(), daemon=True).start()
+async def main():
+    await app_telegram.initialize()
+    await app_telegram.start()
 
-    # Lancer Flask sur le port Render
     port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port, threaded=True)
+    config = Config()
+    config.bind = [f"0.0.0.0:{port}"]
+
+    # Lance Flask (Hypercorn) et Telegram simultanément
+    flask_task = asyncio.create_task(serve(flask_app, config))
+    telegram_task = asyncio.create_task(app_telegram.updater.start_polling())
+
+    await asyncio.gather(flask_task, telegram_task)
+
+if __name__ == "__main__":
+    asyncio.run(main())
