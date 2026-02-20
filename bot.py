@@ -189,7 +189,6 @@ app.add_handler(CommandHandler("top777", top777))
 app.add_handler(CommandHandler("topsecondaire", topsecondaire))
 app.add_handler(CommandHandler("top", top))
 app.add_handler(CommandHandler("groupe", groupe))
-app.run_polling()
 
 # --- Flask Web Service pour Render ---
 flask_app = Flask("")
@@ -200,16 +199,15 @@ def home():
 
 # --- Main async pour Render Free ---
 async def main():
-    await app_telegram.initialize()
-    await app_telegram.start()
+    await app.initialize()
+    await app.start()
 
     port = int(os.environ.get("PORT", 10000))
     config = Config()
     config.bind = [f"0.0.0.0:{port}"]
 
-    # Lance Flask (Hypercorn) et Telegram simultanément
     flask_task = asyncio.create_task(serve(flask_app, config))
-    await app_telegram.updater.start_polling()
+    await app.updater.start_polling()
     await flask_task
 
 if __name__ == "__main__":
