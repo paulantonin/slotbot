@@ -2,8 +2,12 @@ import sqlite3
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
-TOKEN = "TON_TOKEN_ICI"
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
+
+TOKEN = os.getenv("TOKEN")
 # --- Base de données ---
 conn = sqlite3.connect("scores.db", check_same_thread=False)
 cursor = conn.cursor()
