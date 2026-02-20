@@ -1,8 +1,10 @@
 import os
+import random
 import sqlite3
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
+# Récupère le token depuis Environment Variables
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("Le TOKEN n'est pas défini dans les variables d'environnement")
@@ -23,10 +25,11 @@ CREATE TABLE IF NOT EXISTS scores (
 """)
 conn.commit()
 
-# --- Valeurs gagnantes secondaires ---
-SECONDARY_VALUES = [1, 22, 43]  # exemple, tu peux compléter
+# --- Combinaisons secondaires ---
+# Tu peux ajouter toutes les autres combinaisons que tu veux
+SECONDARY_VALUES = [111, 222, 333, 444, 555, 666]  # Exemple
 
-# --- Gestion machine ---
+# --- Gestion machine à sous ---
 async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.dice and update.message.dice.emoji == "🎰":
         user = update.message.from_user
@@ -36,12 +39,16 @@ async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = cursor.fetchone()
 
         if not data:
-            cursor.execute("INSERT INTO scores (user_id, username) VALUES (?, ?)", (user.id, user.first_name))
+            cursor.execute(
+                "INSERT INTO scores (user_id, username) VALUES (?, ?)",
+                (user.id, user.first_name)
+            )
             conn.commit()
 
         cursor.execute("UPDATE scores SET spins = spins + 1 WHERE user_id=?", (user.id,))
 
-        if value == 64:  # Jackpot 777
+        # Jackpot 777
+        if value == 777:
             cursor.execute("""
                 UPDATE scores
                 SET wins_777 = wins_777 + 1,
@@ -50,6 +57,7 @@ async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, (user.id,))
             await update.message.reply_text(f"🎉 JACKPOT 777 pour {user.first_name} !!!")
 
+        # Victoires secondaires
         elif value in SECONDARY_VALUES:
             cursor.execute("""
                 UPDATE scores
@@ -64,7 +72,10 @@ async def handle_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Commandes ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    cursor.execute("SELECT spins, wins_777, secondary_wins, total_wins FROM scores WHERE user_id=?", (user.id,))
+    cursor.execute(
+        "SELECT spins, wins_777, secondary_wins, total_wins FROM scores WHERE user_id=?",
+        (user.id,)
+    )
     data = cursor.fetchone()
     if not data:
         await update.message.reply_text("Aucune statistique trouvée.")
@@ -81,6 +92,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT username, wins_777 FROM scores ORDER BY wins_777 DESC LIMIT 10")
     results = cursor.fetchall()
+    if not results:
+        await update.message.reply_text("Pas encore de victoires 777.")
+        return
     text = "🏆 Classement 777 :\n\n"
     for i, (name, score) in enumerate(results, start=1):
         text += f"{i}. {name} - {score} 🎰\n"
@@ -89,6 +103,9 @@ async def top777(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT username, total_wins FROM scores ORDER BY total_wins DESC LIMIT 10")
     results = cursor.fetchall()
+    if not results:
+        await update.message.reply_text("Pas encore de victoires.")
+        return
     text = "🥇 Classement total des victoires :\n\n"
     for i, (name, score) in enumerate(results, start=1):
         text += f"{i}. {name} - {score} victoires\n"
